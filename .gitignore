@@ -1,0 +1,6 @@
+*.user*
+dist
+Release.x86_64
+Profile.x86_64
+Debug.x86_64
+*.backup
