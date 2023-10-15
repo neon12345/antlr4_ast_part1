@@ -24,6 +24,7 @@ add_custom_target(dist_files SOURCES
                 build_antlr4.sh
                 README.md
                 LICENSE.txt
+                grammar_list.java
 )
 
 add_executable(antlr_pretty

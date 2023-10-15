@@ -10,14 +10,15 @@ using namespace antlr4;
 AntlrAstGenerator::NodeCtx* AntlrAstGenerator::NodeCtx::ctx = nullptr;
 AntlrAstGenerator::NodeNameMap AntlrAstGenerator::NodeCtx::nodes;
 AntlrAstGenerator::NodeDataMap AntlrAstGenerator::NodeCtx::node_data;
+uint32_t AntlrAstGenerator::NodeCtx::num_nodes = 0;
 
 class NoIndent {
 public:
-    NoIndent(int32_t& indent)
+    NoIndent(int32_t& indent, int32_t set_indent = 0)
         : current(indent)
         , ref(indent)
     {
-        indent = 0;
+        indent = set_indent;
     }
     ~NoIndent()
     {
@@ -29,6 +30,7 @@ private:
 };
 
 #define NO_INDENT NoIndent _indent(this->indent); (void)_indent
+#define FORCE_INDENT(VALUE) NoIndent _indent(this->indent, VALUE); (void)_indent
 #define CHECK_COLLECT \
 NodeDataRef info = NodeCtx::getData(ctx);\
 if(info->hasType())\
@@ -97,7 +99,7 @@ UNUSED(ElementOption)
 UNUSED(ExceptionGroup)
 UNUSED(PrequelConstruct)
 UNUSED(ModeSpec)
-UNUSED(Identifier)  // identifiers are references to either parser or lexer rules, the do not store information in the target grammar
+UNUSED(Identifier)  // identifiers are references to either parser or lexer rules, they do not store information in the target grammar
 UNUSED(EbnfSuffix)   // directly used in parent
 
 UNSUPPORTED(DelegateGrammars, "imports are not supported\n")
@@ -166,7 +168,7 @@ public:
     ANTLRv4Parser* parser = nullptr;
 
     void inc_indent() { indent += numindent; }
-    void dev_indent() { indent -= numindent; }
+    void dec_indent() { indent -= numindent; }
 
     void blockBegin()
     {
@@ -176,7 +178,7 @@ public:
 
     void blockEnd()
     {
-        dev_indent();
+        dec_indent();
         newln();
     }
 
@@ -219,6 +221,158 @@ public:
 
 static DebugPrinter debug;
 
+void AntlrAstGenerator::NodeData::find_fields(StateMap* state)
+{
+    uint32_t field_idx = 0;
+    uint32_t origin_idx;
+    for(const Field& field : types.fields)
+    {
+        origin_idx = 0;
+        for(const FieldID& id : field.field_origin)
+        {
+            std::vector<uint32_t> states = state->getState(id.origin->ctx);
+            for(uint32_t st : states)
+            {
+                FieldInfo info;
+                info.field_idx = field_idx;
+                info.origin_idx = origin_idx;
+                info.owner = this;
+                info.state = st != -1 ? st : 0xFFFFFFFE;
+                if(id.target)
+                {
+                    if(!id.target->with_alternative())
+                    {
+                        id.target->fields.push_back(info);
+                    }
+                    else
+                    {
+                        for(auto & child : id.target->getClassChilden())
+                        {
+                            child->fields.push_back(info);
+                        }
+                    }
+                }
+            }
+
+            origin_idx += 1;
+        }
+        field_idx += 1;
+    }
+}
+
+std::string AntlrAstGenerator::NodeData::getClassName()
+{
+    std::string name = getName();
+    if(utf8_first_char_len(name.data(), name.size()) == 1)
+    {
+        name.data()[0] = std::toupper(name.data()[0]);
+    }
+    return name;
+}
+void AntlrAstGenerator::NodeData::find_field_names()
+{
+    char tmp[64];
+    uint32_t num_str = 0;
+    uint32_t idx = 0;
+    std::set<std::string> used_names;
+    field_names.resize(types.fields.size(), "");
+    for(const Field& field : types.fields)
+    {
+        switch(field.type)
+        {
+        case FieldType::Flag:
+            break;
+        case FieldType::RuleRef:
+            if(field.field_origin.size() == 1)
+            {
+                NodeData* node = field.field_origin[0].target;
+                std::string name = node->getName();
+                if(field.is_collection)
+                {
+                    name += "s";
+                }
+                while(used_names.find(name) != used_names.end())
+                    name += "1";
+
+                used_names.insert(name);
+                name += "_";
+                field_names[idx] = name;
+            }
+            else
+            {
+                sprintf(tmp, "val%i", num_str);
+                field_names[idx] = std::string(tmp);
+                num_str += 1;
+            }
+            break;
+        case FieldType::String:
+            if(field.field_origin.size() == 1)
+            {
+                NodeData* owner = field.field_origin[0].origin;
+                std::string name = owner->getRaw();
+                while(used_names.find(name) != used_names.end())
+                    name += "1";
+
+                used_names.insert(name);
+                name += "_";
+                field_names[idx] = name;
+            }
+            else
+            {
+                sprintf(tmp, "str%i", num_str);
+                field_names[idx] = std::string(tmp);
+                num_str += 1;
+            }
+            break;
+        default:
+            break;
+        }
+        idx += 1;
+    }
+}
+
+void AntlrAstGenerator::NodeData::try_merge()
+{
+    TypeInfo collections;
+    TypeInfo refs;
+    for(auto& field : types.fields)
+    {
+        if(field.isType(FieldType::RuleRef))
+        {
+            if(field.is_collection)
+            {
+                collections.fields.push_back(field);
+            }
+        }
+    }
+
+    if(collections.fields.size() != 0)
+    {
+        for(auto& field : types.fields)
+        {
+            if(field.isType(FieldType::RuleRef))
+            {
+                if(field.is_collection)
+                    continue;
+                if(!field.is_nullable)
+                {
+                    for(auto& col_field : collections.fields)
+                    {
+                        // TODO check for type match
+                        col_field.copy_from(field);
+                        break;
+                    }
+                    continue;
+                }
+            }
+
+            refs.fields.push_back(field);
+        }
+        refs.fields.insert(std::end(refs.fields), std::begin(collections.fields), std::end(collections.fields));
+        types.fields.swap(refs.fields);
+    }
+
+}
 
 bool AntlrAstGenerator::NodeData::propagate(AntlrAstGenerator::NodeDataRef child)
 {
@@ -250,7 +404,7 @@ void AntlrAstGenerator::NodeData::propagate(TypeInfo& child_types)
     types.paths = 1;
 
     if(is_rule && !skip_rule)
-        print();
+        debug_print();
 }
 
 void AntlrAstGenerator::TypeInfo::clear()
@@ -270,8 +424,11 @@ AntlrAstGenerator::Field* AntlrAstGenerator::TypeInfo::findCompatible(Field& fin
     {
         for(auto& target_field : fields)
         {
+
+
+
             if(target_field.type == find.type &&        // the FieldTypes match
-               (target_field.is_collection != find.is_collection || find.is_collection == false) &&      // cannot merge two collections => only one or none can be collection
+               (!find.is_collection || target_field.is_collection) &&   // if the target is no collection then find must not be a collection
                target_field.is_not == find.is_not &&
                target_field.is_nullable == find.is_nullable)
             {
@@ -283,9 +440,16 @@ AntlrAstGenerator::Field* AntlrAstGenerator::TypeInfo::findCompatible(Field& fin
     return nullptr;
 }
 
-void AntlrAstGenerator::TypeInfo::add_needed(AntlrAstGenerator::NodeDataRef child)
+bool AntlrAstGenerator::TypeInfo::add_needed(AntlrAstGenerator::NodeDataRef child)
 {
     TypeInfo& child_types = child->types;
+    // * if the child contains a single RuleRef then make the parent a superclass
+    //   (with refcount == 1)
+    NodeData* node_info = child->single_ruleRef();
+    if(node_info)
+        return false;
+
+    TypeInfo combined;  // need merge AND fields later
     for(auto& field : child_types.fields)
     {
         Field* existing = findCompatible(field);
@@ -295,24 +459,66 @@ void AntlrAstGenerator::TypeInfo::add_needed(AntlrAstGenerator::NodeDataRef chil
         }
         else
         {
-            fields.push_back(field);
+            combined.fields.push_back(field);
         }
     }
+    fields.insert(std::end(fields), std::begin(combined.fields), std::end(combined.fields));
+    return true;
 }
 
 void AntlrAstGenerator::TypeInfo::add_all(AntlrAstGenerator::NodeDataRef child)
 {
     auto& target_fields = fields;
     auto& child_fields = child->types.fields;
-    target_fields.insert(std::end(target_fields), std::begin(child_fields), std::end(child_fields));
+    // * if the child contains a single RuleRef then add the fields to the RuleRef
+    //   and propagate the RuleRef
+    // * if the child has multiple RuleRef/data and one RuleRef has refcount == 1
+    //   then move the other data and RuleRefs into this Rule
+    // * if there is a collection of RuleRefs then merge all mandatory RuleRefs of the same kind into the collection
+    NodeData* node_info = child->single_ruleRef();
+    if(node_info != nullptr)
+    {
+        for(auto& field : child_fields)
+        {
+            if(!field.isType(FieldType::RuleRef))
+            {
+                node_info->types.fields.push_back(field);
+            }
+            else
+            {
+                target_fields.push_back(field);
+            }
+        }
+    }
+    else
+    {
+        target_fields.insert(std::end(target_fields), std::begin(child_fields), std::end(child_fields));
+    }
+}
+
+AntlrAstGenerator::NodeData* AntlrAstGenerator::NodeData::single_ruleRef()
+{
+    NodeData* node_info = nullptr;
+    for(auto& field : types.fields)
+    {
+        if(field.isType(FieldType::RuleRef))
+        {
+            if(node_info != nullptr || field.field_origin.size() != 0 || field.is_collection || field.is_nullable)
+            {
+                node_info = nullptr;
+                break;
+            }
+            node_info = field.field_origin[0].target;
+        }
+    }
+    return node_info;
 }
 
 void AntlrAstGenerator::NodeData::addFlag()
 {
     FieldID id;
-    id.owner = this;
-    id.idx = num_fields;
-    num_fields += 1;
+    id.origin = this;
+    id.target = nullptr;
     Field field;
     field.type = FieldType::Flag;
     field.field_origin.push_back(id);
@@ -321,37 +527,35 @@ void AntlrAstGenerator::NodeData::addFlag()
 
 void AntlrAstGenerator::NodeData::addPath_RuleRef(NodeData *target)
 {
+    //debug.fprint("add rule: %s\n", target->getName().c_str());
     FieldID id;
-    id.owner = this;
-    id.idx = num_fields;
-    num_fields += 1;
+    id.origin = this;
+    id.target = target;
     Field field;
     field.type = FieldType::RuleRef;
     field.field_origin.push_back(id);
-    field.rule_refs.push_back(target);
     types.fields.push_back(field);
     addPath();
 }
 
-void AntlrAstGenerator::NodeData::addPath_RuleRefFiled(NodeData *target, Field& field)
+void AntlrAstGenerator::NodeData::addPath_RuleRef(NodeData *target, TypeInfo& types)
 {
+    //debug.fprint("add rule: %s\n", target->getName().c_str());
     FieldID id;
-    id.owner = this;
-    id.idx = num_fields;
-    num_fields += 1;
+    id.origin = this;
+    id.target = target;
+    Field field;
     field.type = FieldType::RuleRef;
     field.field_origin.push_back(id);
-    field.rule_refs.push_back(target);
     types.fields.push_back(field);
-    addPath();
 }
 
-void AntlrAstGenerator::NodeData::addPath_String()
+void AntlrAstGenerator::NodeData::addPath_String(NodeData *target)
 {
+    //debug.fprint("add string: %s\n", target->getName().c_str());
     FieldID id;
-    id.owner = this;
-    id.idx = num_fields;
-    num_fields += 1;
+    id.origin = this;
+    id.target = target;
     Field field;
     field.type = FieldType::String;
     field.field_origin.push_back(id);
@@ -366,10 +570,13 @@ void AntlrAstGenerator::NodeData::addPath()
 
 bool AntlrAstGenerator::NodeData::canSkip()
 {
-    return ref_count == 1;
+    if(types.paths == 0)
+        return false;
+    uint32_t num = types.fields.size();
+    return num == 0 || (types.fields.size() == 1 && types.fields[0].isType(FieldType::Flag));
 }
 
-void AntlrAstGenerator::Field::print()
+void AntlrAstGenerator::Field::debug_print()
 {
     debug.print("Field:");
     debug.blockBegin();
@@ -404,18 +611,16 @@ void AntlrAstGenerator::Field::print()
         debug.print("String");
         break;
     }
-    this->rule_refs;
-    this->field_origin;
+    //this->field_origin;
     debug.blockEnd();
 }
 
 void AntlrAstGenerator::Field::copy_from(Field &other)
 {
-    rule_refs.insert(std::end(rule_refs), std::begin(other.rule_refs), std::end(other.rule_refs));
     field_origin.insert(std::end(field_origin), std::begin(other.field_origin), std::end(other.field_origin));
 }
 
-void AntlrAstGenerator::TypeInfo::print()
+void AntlrAstGenerator::TypeInfo::debug_print()
 {
     debug.print("TypeInfo:");
     debug.blockBegin();
@@ -427,7 +632,7 @@ void AntlrAstGenerator::TypeInfo::print()
         if(field.isType(FieldType::Flag))
             num_flags += 1;
 
-        field.print();
+        field.debug_print();
     }
     if(num_flags == 0)
     {
@@ -438,7 +643,7 @@ void AntlrAstGenerator::TypeInfo::print()
 }
 
 
-void AntlrAstGenerator::NodeData::print()
+void AntlrAstGenerator::NodeData::debug_print()
 {
     debug.print("NodeData:");
     debug.blockBegin();
@@ -472,7 +677,7 @@ void AntlrAstGenerator::NodeData::print()
         debug.print("skip_rule");
         debug.newln();
     }
-    types.print();
+    types.debug_print();
     if(ctx)
     {
         debug.print("raw: ");
@@ -482,7 +687,47 @@ void AntlrAstGenerator::NodeData::print()
     debug.blockEnd();
 }
 
-AntlrAstGenerator::AntlrAstGenerator(ANTLRv4Parser* parser, antlr4::ParserRuleContext* parser_root, antlr4::ParserRuleContext *lexer_root, int32_t numindent)
+bool StateMap::parse(std::string file)
+{
+    std::ifstream infile(file);
+
+    std::string line;
+    int state;
+    int interval_a;
+    int interval_b;
+
+    while(std::getline(infile, line))
+    {
+        std::sscanf(line.c_str(), "%d,%d,%d", &state, &interval_a, &interval_b);
+        if(interval_a != -1)
+        {
+            uint64_t key = (static_cast<uint64_t>(interval_a) << 32) | static_cast<uint64_t>(interval_b);
+            if(map.find(key) == map.end())
+                map[key] = std::vector<uint32_t>();
+            map[key].push_back(state);
+        }
+    }
+    return true;
+}
+
+std::vector<uint32_t>& StateMap::getState(ParserRuleContext *ctx)
+{
+    static std::vector<uint32_t> empty;
+    int interval_a = ctx->start->getStartIndex();
+    int interval_b = ctx->stop->getStopIndex();
+
+    auto IT = map.find((static_cast<uint64_t>(interval_a) << 32) | static_cast<uint64_t>(interval_b));
+
+    if(IT != map.end())
+    {
+        return IT->second;
+    }
+    if(ctx->parent)
+        return getState(static_cast<ParserRuleContext*>(ctx->parent));
+    return empty;
+}
+
+AntlrAstGenerator::AntlrAstGenerator(ANTLRv4Parser* parser, antlr4::ParserRuleContext* parser_root, antlr4::ParserRuleContext *lexer_root, StateMap* state, int32_t numindent)
     : numindent(numindent)
     , first_in_line(true)
     , indent(0)
@@ -492,6 +737,7 @@ AntlrAstGenerator::AntlrAstGenerator(ANTLRv4Parser* parser, antlr4::ParserRuleCo
     , out(nullptr)
     , source(nullptr)
     , header(nullptr)
+    , state(state)
 
 {
     LexerRuleFinder::getMap(map, parser_root, lexer_root);
@@ -518,13 +764,21 @@ bool AntlrAstGenerator::openSource(const char* file)
     return source != nullptr;
 }
 
+void AntlrAstGenerator::fprint(const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    vfprintf(out, format, args);
+    va_end (args);
+}
+
 void AntlrAstGenerator::print(const char* str)
 {
     fprintf(out, "%s", str);
     first_in_line = false;
 }
 
-void AntlrAstGenerator::print(std::string& str)
+void AntlrAstGenerator::print(const std::string& str)
 {
     print(str.data(), str.size());
 }
@@ -577,7 +831,7 @@ void AntlrAstGenerator::blockBegin(bool paren)
 
 void AntlrAstGenerator::blockEnd(bool paren)
 {
-    dev_indent();
+    dec_indent();
     newln();
     if(paren)
         print("}");
@@ -623,6 +877,20 @@ void AntlrAstGenerator::space(bool only_when_not_first)
 
 std::any AntlrAstGenerator::visitGrammarSpec(ANTLRv4Parser::GrammarSpecContext *ctx)
 {
+    bool first_node = true;
+    // run tree passes
+    passes.addPass(VisitPass::COLLECT_RULES);
+    visitChildren(ctx);
+    passes.reset();
+    passes.addPass(VisitPass::COUNT_REFS);
+    visitChildren(ctx);
+    passes.reset();
+    passes.addPass(VisitPass::COLLECT_TYPES);
+    while(!NodeCtx::getData(ctx->rules())->hasType())
+        visitChildren(ctx);
+    passes.reset();
+
+    // begin print
     setHeader();
     print("#include \"AstBuilderBase.h\"");
     newln();
@@ -637,6 +905,68 @@ std::any AntlrAstGenerator::visitGrammarSpec(ANTLRv4Parser::GrammarSpecContext *
     print("AstBuilder();");
     newln();
     print("virtual ~AstBuilder();");
+    newln();
+
+    // print rule class type enum
+    print("enum class NodeType  : int32_t");
+    blockBegin();
+    for(auto& IT : NodeCtx::getNodes())
+    {
+        NodeDataRef& node = IT.second;
+        if(node->isRule() && !node->with_alternative())
+        {
+            print(node->getClassName());
+            fprint(" = %u,", node->getID());
+            newln();
+        }
+    }
+    blockEnd();
+    print(";");
+    newln();
+
+    print("class Node {");
+    inc_indent();
+    {
+        FORCE_INDENT(numindent);
+        newln();
+        print("public:");
+    }
+    newln();
+    print("Node(NodeType type) : type(type) {}");
+    newln();
+
+    // print method
+    print("void print()");
+    blockBegin();
+    print("switch(type)");
+    blockBegin();
+    for(auto& IT : NodeCtx::getNodes())
+    {
+        NodeDataRef& node = IT.second;
+        if(node->isRule() && !node->with_alternative())
+        {
+            print("case NodeType::");
+            print(node->getClassName());
+            print(":");
+            inc_indent();
+            newln();
+            print("static_cast<");
+            print(node->getClassName());
+            print("*>(this)->print();");
+            newln();
+            print("break;");
+            dec_indent();
+            newln();
+        }
+    }
+    blockEnd();
+    blockEnd();
+    newln();
+
+    print("NodeType type;");
+    blockEnd();
+    print(";");
+    newln();
     setSource();
 
     print("#include \"AstBuilder.h\"");
@@ -650,20 +980,32 @@ std::any AntlrAstGenerator::visitGrammarSpec(ANTLRv4Parser::GrammarSpecContext *
     print("AstBuilder::~AstBuilder() {}");
     newln();
 
-    passes.addPass(VisitPass::COLLECT_RULES);
-    visitChildren(ctx);
-    passes.reset();
-    passes.addPass(VisitPass::COUNT_REFS);
-    visitChildren(ctx);
-    passes.reset();
-    passes.addPass(VisitPass::COLLECT_TYPES);
-    while(!NodeCtx::getData(ctx->rules())->hasType())
-        visitChildren(ctx);
-    passes.reset();
-    passes.addPass(VisitPass::CREATE_NODES);
-    visitChildren(ctx);
+    setHeader();
+
+    // finish fields
+    for(auto& IT : NodeCtx::getNodes())
+    {
+        NodeDataRef& node = IT.second;
+        if(node->isRule())
+        {
+            node->find_field_names();
+            node->find_fields(state);
+        }
+    }
+
+    // print rule classes
+    for(auto& IT : NodeCtx::getNodes())
+    {
+        NodeDataRef& node = IT.second;
+        if(node->isRule())
+        {
+            printRuleNode(node->getName(), node, first_node);
+            first_node = false;
+        }
+    }
 
     setHeader();
+
     {
         NO_INDENT;
         newln();
@@ -681,13 +1023,324 @@ void AntlrAstGenerator::addRuleNode(std::string& name, NodeDataRef node)
     NodeCtx::addLink(name, node);
 }
 
-void AntlrAstGenerator::printRuleNode(std::string& name, NodeDataRef node)
+void AntlrAstGenerator::printRuleName(NodeData* node)
+{
+    if(node->isRule())
+    {
+        print(node->getName());
+        //print(parser->getRuleNames()[node->getRuleIndex()]);
+    }
+    else
+    {
+    }
+}
+
+void AntlrAstGenerator::printField_Stores(NodeDataRef node)
+{
+    auto& fields = node->getFields();
+    std::sort(fields.begin(), fields.end(), [](const FieldInfo& lhs, const FieldInfo& rhs)
+    {
+       return lhs.state < rhs.state;
+    });
+    auto IT = fields.begin();
+    auto END = fields.end();
+
+    while(IT != END)
+    {
+        const FieldInfo& info = *IT;
+        const Field& field = info.owner->getTypes().fields[info.field_idx];
+        const FieldID& fieldID = field.field_origin[info.origin_idx];
+        if(field.type == FieldType::String)
+        {
+            newln();
+            print("if(!isEmpty(ctx->");
+            print(fieldID.origin->getRaw());
+            print("()))");
+            blockBegin();
+            print("assign_text(");
+            print("node->");
+            print(info.owner->get_field_name(info.field_idx));
+            if(field.is_collection)
+            {
+                print(", ctx->");
+                print(fieldID.origin->getRaw());
+                print("());");
+            }
+            else
+            {
+                print(", ctx->");
+                print(fieldID.origin->getRaw());
+                print("());");
+            }
+            blockEnd();
+        }
+        IT++;
+    }
+
+    IT = fields.begin();
+    END = fields.end();
+
+    newln();
+    print("switch(getState(ctx))");
+    blockBegin();
+    while(IT != END)
+    {
+        uint32_t state = IT->state;
+        fprint("case %u:", state);
+        inc_indent();
+        do
+        {
+            const FieldInfo& info = *IT;
+            const Field& field = info.owner->getTypes().fields[info.field_idx];
+            if(field.type != FieldType::String)
+            {
+                newln();
+                switch(field.type)
+                {
+                case FieldType::RuleRef:
+                    break;
+                default:
+                    break;
+                }
+                std::string owner_name = info.owner->getClassName();
+                fprint("reinterpret_cast<%s*>(topNode())->", owner_name.c_str());
+                print(info.owner->get_field_name(info.field_idx));
+                switch(field.type)
+                {
+                case FieldType::RuleRef:
+                    if(field.is_collection)
+                    {
+                        print(".push_back(std::move(node));");
+                    }
+                    else
+                    {
+                        print(" = std::move(node);");
+                    }
+                    break;
+                default:
+                    break;
+                }
+            }
+
+            //print(field.owner->types.fields[field.field_idx]);
+
+            IT++;
+        }
+        while(IT != END && IT->state == state);
+        newln();
+        print("break;");
+        dec_indent();
+        newln();
+    }
+    print("default:");
+    inc_indent();
+    newln();
+    print("break;");
+    dec_indent();
+    blockEnd();
+}
+
+void AntlrAstGenerator::print_PrintFn(NodeDataRef node)
+{
+    newln();
+    print("void print()");
+    blockBegin();
+    uint32_t idx = 0;
+    bool first = true;
+    for(const Field& field : node->getTypes().fields)
+    {
+        switch(field.type)
+        {
+        case FieldType::Flag:
+            break;
+        case FieldType::RuleRef:
+            if(!first)
+            {
+                newln();
+            }
+            else
+            {
+                first = false;
+            }
+            if(field.is_collection)
+            {
+                print("for(auto& item : ");
+                print(node->get_field_name(idx));
+                print(")");
+                blockBegin();
+                print("item->print();");
+                blockEnd();
+            }
+            else
+            {
+                print("if(");
+                print(node->get_field_name(idx));
+                print(" != nullptr)");
+                blockBegin();
+                print(node->get_field_name(idx));
+                print("->print();");
+                blockEnd();
+            }
+            break;
+        case FieldType::String:
+            if(!first)
+            {
+                newln();
+            }
+            else
+            {
+                first = false;
+            }
+            if(field.is_collection)
+            {
+                print("for(std::string& str : ");
+                print(node->get_field_name(idx));
+                print(")");
+                blockBegin();
+                print("if(str != \"\") std::cout << str << std::endl;");
+                blockEnd();
+            }
+            else
+            {
+                print("if(");
+                print(node->get_field_name(idx));
+                print(" != \"\") std::cout << ");
+                print(node->get_field_name(idx));
+                print(" << std::endl;");
+            }
+            break;
+        default:
+            break;
+        }
+        idx += 1;
+    }
+    blockEnd();
+}
+
+void AntlrAstGenerator::printField_Decls(NodeDataRef node)
+{
+    uint32_t idx = 0;
+    for(const Field& field : node->getTypes().fields)
+    {
+        switch(field.type)
+        {
+        case FieldType::Flag:
+            break;
+        case FieldType::RuleRef:
+            newln();
+            if(field.is_collection)
+            {
+                print("std::vector<std::unique_ptr<Node>> ");
+            }
+            else
+            {
+                print("std::unique_ptr<Node> ");
+            }
+            if(field.field_origin.size() == 1)
+            {
+                print(node->get_field_name(idx));
+                print(";");
+            }
+            else
+            {
+                uint32_t num = 0;
+                print(node->get_field_name(idx));
+                print(";");
+                fprint(" // ");
+
+                for(auto & origin : field.field_origin)
+                {
+                    if(num != 0)
+                    {
+                        fprint(", ");
+                    }
+                    printRuleName(origin.target);
+
+                    num += 1;
+                }
+            }
+            break;
+        case FieldType::String:
+            newln();
+            if(field.is_collection)
+            {
+                print("std::vector<std::string> ");
+            }
+            else
+            {
+                print("std::string ");
+            }
+            if(field.field_origin.size() == 1)
+            {
+                print(node->get_field_name(idx));
+                print(";");
+            }
+            else
+            {
+                uint32_t num = 0;
+                print(node->get_field_name(idx));
+                print(";");
+                fprint(" // ");
+
+                for(auto & origin : field.field_origin)
+                {
+                    if(num != 0)
+                    {
+                        fprint(", ");
+                    }
+                    printRuleName(origin.target);
+
+                    num += 1;
+                }
+            }
+            break;
+        default:
+            break;
+        }
+        idx += 1;
+    }
+}
+
+void AntlrAstGenerator::printRuleNode(std::string& name, NodeDataRef node, bool root)
 {
     if(node->need_rule())
     {
         if(utf8_first_char_len(name.data(), name.size()) == 1)
         {
             name.data()[0] = std::toupper(name.data()[0]);
+        }
+
+        if(node->no_skip())
+        {
+            setHeader();
+            newln();
+            print("class ");
+            print(name);
+            print(" : public Node");
+            inc_indent();
+            {
+                FORCE_INDENT(numindent);
+                newln();
+                print("{");
+                newln();
+                print("public:");
+            }
+            newln();
+            print(name);
+            print("() : Node(NodeType::");
+            print(name);
+            print(") {}");
+            print_PrintFn(node);
+            printField_Decls(node);
+            {
+                FORCE_INDENT(numindent);
+                newln();
+                print("private:");
+            }
+            blockEnd();
+            print(";");
+            newln();
+            setSource();
         }
 
         newln();
@@ -697,11 +1350,32 @@ void AntlrAstGenerator::printRuleNode(std::string& name, NodeDataRef node)
         print(name);
         print("Context * ctx)");
         blockBegin();
-        print("pushNode(ctx);");
+        print("std::unique_ptr<");
+        print(name);
+        print("> node(new ");
+        print(name);
+        print("());");
+        newln();
+        print("pushNode(node.get());");
         newln();
         print("visitChildren(ctx);");
         newln();
-        print("return true;");
+        print("popNode();");
+        printField_Stores(node);
+        newln();
+        if(!root)
+        {
+            print("return true;");
+        }
+        else
+        {
+            print(name);
+            print("* ret = node.get();");
+            newln();
+            print("node.release();");
+            newln();
+            print("return ret;");
+        }
         blockEnd();
         newln();
         setHeader();
@@ -721,7 +1395,7 @@ std::any AntlrAstGenerator::visitRules(ANTLRv4Parser::RulesContext *ctx)
     BEGIN_PASS_VISIT;
 
     HANDLE_PASS(COLLECT_TYPES)
-{
+    {
         CHECK_COLLECT;
 
         for(auto & rule : ctx->ruleSpec())
@@ -742,7 +1416,7 @@ std::any AntlrAstGenerator::visitRuleSpec(ANTLRv4Parser::RuleSpecContext *ctx)
     BEGIN_PASS_VISIT;
 
     HANDLE_PASS(COLLECT_TYPES)
-{
+    {
         CHECK_COLLECT;
 
         NodeDataRef node_info = NodeCtx::getData(ctx->parserRuleSpec());
@@ -775,12 +1449,10 @@ std::any AntlrAstGenerator::visitParserRuleSpec(ANTLRv4Parser::ParserRuleSpecCon
         NodeDataRef node_info = NodeCtx::getData(ctx->ruleBlock());
         if(!node_info->hasType())
             return false;
-        info->propagate(node_info);
-    }
 
-    HANDLE_PASS(CREATE_NODES)
-    {
-        printRuleNode(name, node);
+        node_info->try_merge();
+        info->propagate(node_info);
+
     }
 
     END_PASS_VISIT;
@@ -807,6 +1479,7 @@ std::any AntlrAstGenerator::visitRuleAltList(ANTLRv4Parser::RuleAltListContext *
     HANDLE_PASS(COLLECT_TYPES)
     {
         // RuleAltList connects elements with OR => possibly multiple elements depending on types
+        // possibly with label
         CHECK_COLLECT;
 
         TypeInfo combined;
@@ -815,9 +1488,18 @@ std::any AntlrAstGenerator::visitRuleAltList(ANTLRv4Parser::RuleAltListContext *
             NodeDataRef node_info = NodeCtx::getData(lbl);
             if(!node_info->hasType())
                 return false;
-            combined.add_needed(node_info);
-            // add a path for each alternative
-            combined.paths += 1;
+            if(!node_info->isRule())
+            {
+                if(combined.add_needed(node_info))
+                    // add a path for each alternative
+                    combined.paths += 1;
+            }
+            else
+            {
+                NodeCtx nctx(node_info);
+                nctx.getParentData()->getClassChilden().push_back(node_info.get());
+                //node_info->addPath_RuleRef(node_info.get(), combined);
+            }
         }
         info->propagate(combined);
     }
@@ -836,9 +1518,9 @@ std::any AntlrAstGenerator::visitLabeledAlt(ANTLRv4Parser::LabeledAltContext *ct
 
     if(ctx->identifier())
     {
+        NodeCtx nctx(node_info);
         HANDLE_PASS(COLLECT_RULES)
         {
-            NodeCtx nctx(node_info);
             addRuleNode(name, node_info);
             nctx.getParentData()->set_alternative();
             VISIT_CHILDREN;
@@ -846,7 +1528,6 @@ std::any AntlrAstGenerator::visitLabeledAlt(ANTLRv4Parser::LabeledAltContext *ct
 
         HANDLE_PASS(COUNT_REFS)
         {
-            NodeCtx nctx(node_info);
             node_info->addCount();
             VISIT_CHILDREN;
         }
@@ -860,11 +1541,6 @@ std::any AntlrAstGenerator::visitLabeledAlt(ANTLRv4Parser::LabeledAltContext *ct
             PROPAGATE_TYPE(alternative);
     }
 
-    HANDLE_PASS(CREATE_NODES)
-    {
-        printRuleNode(name, node_info);
-    }
-
     END_PASS_VISIT;
 }
 
@@ -874,7 +1550,7 @@ std::any AntlrAstGenerator::visitAltList(ANTLRv4Parser::AltListContext *ctx)
 
     HANDLE_PASS(COLLECT_TYPES)
     {
-        // can have multiple items including symbols
+        // AltList connects elements with OR => possibly multiple elements depending on types
         CHECK_COLLECT;
 
         TypeInfo combined;
@@ -1127,7 +1803,7 @@ std::any AntlrAstGenerator::visitBlock(ANTLRv4Parser::BlockContext *ctx)
     BEGIN_PASS_VISIT;
 
     HANDLE_PASS(COLLECT_TYPES)
-{
+    {
         CHECK_COLLECT;
 
         if(ctx->altList())
@@ -1147,6 +1823,8 @@ std::any AntlrAstGenerator::visitRuleref(ANTLRv4Parser::RulerefContext *ctx)
         std::string name = ctx->RULE_REF()->getText();
         NodeData* node = NodeCtx::getData(name);
 
+        info->addPath_RuleRef(node);
+        /*
         if(!node->canSkip())
         {
             info->addPath_RuleRef(node);
@@ -1157,6 +1835,7 @@ std::any AntlrAstGenerator::visitRuleref(ANTLRv4Parser::RulerefContext *ctx)
             node->setSkip();
             info->propagate(node);
         }
+        */
     }
 
     HANDLE_PASS(COUNT_REFS)
@@ -1176,7 +1855,9 @@ std::any AntlrAstGenerator::visitCharacterRange(ANTLRv4Parser::CharacterRangeCon
     HANDLE_PASS(COLLECT_TYPES)
     {
         CHECK_COLLECT;
-        info->addPath_String();
+        NodeCtx nctx(info);
+        info->addPath_String(nctx.getParentData());
+        //debug.fprint("char range STR\n");
     }
 
     END_PASS_VISIT;
@@ -1194,9 +1875,16 @@ std::any AntlrAstGenerator::visitTerminal(ANTLRv4Parser::TerminalContext *ctx)
         if(ctx->TOKEN_REF())
         {
             if(isLiteral(ctx->TOKEN_REF()))
+            {
                 info->addPath();
+            }
             else
-                info->addPath_String();
+            {
+                NodeCtx nctx(info);
+                //debug.fprint("string terminal STR %s for %s\n", ctx->getText().c_str(), nctx.getParentData()->getRaw().c_str());
+                /* dynamic strings from lexer rules are added here => no need to go through  */
+                info->addPath_String(nctx.getParentData());  // TODO get the parent rule as target
+            }
         }
         else
         {

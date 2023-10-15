@@ -14,9 +14,10 @@
 using namespace antlr4;
 
 int main(int argc, char** argv) {
-    if(argc <= 4) return 1;
+    if(argc <= 5) return 1;
     std::string parserFile = argv[1];
     std::string lexerFile = argv[2];
+    std::string stateFile = argv[3];
     std::fstream parserFS;
     std::fstream lexerFS;
     parserFS.open(parserFile, std::fstream::in | std::fstream::out | std::fstream::app);
@@ -32,14 +33,16 @@ int main(int argc, char** argv) {
     CommonTokenStream* lexer_tokens = new CommonTokenStream(lexer_lexer);
     ANTLRv4Parser* lexer_parser = new ANTLRv4Parser(lexer_tokens);
 
-
     auto* parser_root = parser_parser->grammarSpec();
     auto* lexer_root = lexer_parser->grammarSpec();
 
-    AntlrAstGenerator visitor(parser_parser, parser_root, lexer_root);
+    StateMap state;
+    state.parse(stateFile);
 
-    visitor.openHeader(argv[3]);
-    visitor.openSource(argv[4]);
+    AntlrAstGenerator visitor(parser_parser, parser_root, lexer_root, &state);
+
+    visitor.openHeader(argv[4]);
+    visitor.openSource(argv[5]);
 
     visitor.visit(parser_root);
 

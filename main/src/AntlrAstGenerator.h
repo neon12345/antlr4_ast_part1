@@ -7,6 +7,16 @@
 #include <stdint.h>
 #include <stdio.h>
 
+class StateMap
+{
+public:
+    bool parse(std::string file);
+
+    std::vector<uint32_t>& getState(antlr4::ParserRuleContext* ctx);
+private:
+    std::unordered_map<uint64_t, std::vector<uint32_t>> map;
+};
+
 class ANTLRv4Lexer;
 class LexerRuleFinder : public ANTLRv4ParserBaseVisitor
 {
@@ -120,18 +130,17 @@ class AntlrAstGenerator : public ANTLRv4ParserBaseVisitor
     class FieldID
     {
     public:
-        NodeData* owner = nullptr;
-        int32_t   idx   = -1;
+        NodeData* origin = nullptr;   // the antlr grammar node where this field was created
+        NodeData* target = nullptr;   // the rule node referenced by this type field (e.g. the rule_ref or the "parent owner" for strings)
     };
 
     class Field
     {
     public:
-        void print();
+        void debug_print();
         bool isType(FieldType ty) { return type == ty; }
         void setType(FieldType ty) { type = ty; }
         void copy_from(Field& other);
-        std::vector<NodeData*> rule_refs;                   // the rule nodes referenced by this type field
         std::vector<FieldID> field_origin;                  // a reference to the origin node(s) of the field
         FieldType type          = FieldType::Unknown;
         bool is_collection      = false;
@@ -143,13 +152,31 @@ class AntlrAstGenerator : public ANTLRv4ParserBaseVisitor
     class TypeInfo
     {
     public:
-        void print();
+        void debug_print();
         void clear();
-        void add_needed(NodeDataRef child);
+        bool add_needed(NodeDataRef child);
         void add_all(NodeDataRef child);
         Field* findCompatible(Field& field);
         int32_t paths   = 0;
         std::vector<Field> fields;
+    };
+
+    enum class NodeDataType : int32_t
+    {
+        Unknown    = 0,
+        Ignore     = 1,
+        Class      = 2,
+        Operator   = 3,
+        SuperClass = 4
+    };
+
+    class FieldInfo
+    {
+    public:
+        NodeData* owner;
+        uint32_t  state;            // the antlr state when this field is used
+        int16_t   field_idx;        // index into the owners fields vector
+        int16_t   origin_idx;       // index into the fields origin vector
     };
 
     class NodeData
@@ -161,29 +188,73 @@ class AntlrAstGenerator : public ANTLRv4ParserBaseVisitor
         void addCount(int32_t step = 1) { ref_count += step; }
 
         bool need_rule() { return !has_alternative; }
+        bool no_skip() { return !skip_rule; }
         void setRule() { is_rule = true; }
 
+        void try_merge();
+        void find_field_names();
+        void find_fields(StateMap *state);
         bool propagate(NodeDataRef child);
         bool propagate(NodeData* child);
         void propagate(TypeInfo& child_types);
         void addPath_RuleRef(NodeData* target);
-        void addPath_RuleRefFiled(NodeData *target, Field& field);
-        void addPath_String();
+        void addPath_RuleRef(NodeData* target, TypeInfo& types);
+        void addPath_String(NodeData *target);
         void addPath();
         void addFlag();
+        NodeData* single_ruleRef();
         void set_alternative() { has_alternative = true; }
+        bool with_alternative() { return has_alternative; }
         bool canSkip();
         void setSkip() { skip_rule = true; }
 
         TypeInfo& getTypes() { return types; }
+        std::vector<FieldInfo>& getFields() { return fields; }
+        std::string get_field_name(uint32_t idx) { return field_names[idx]; }
 
-        void print();
+        std::vector<NodeData*>& getClassChilden() { return class_children; }
+
+        void debug_print();
+
+        std::string& getName()
+        {
+            return name;
+        }
+
+        std::string getClassName();
+
+        int32_t getRuleIndex()
+        {
+            return ctx->getRuleIndex();
+        }
+        std::string getRaw()
+        {
+            return ctx->getText();
+        }
+        bool isRule() { return is_rule; }
+        uint32_t getID()
+        {
+            return id;
+        }
+
     private:
+        uint32_t id;
         std::string name;
         TypeInfo types;
+        std::vector<std::string> field_names;       // store for the field names
+        std::vector<FieldInfo> fields;              // the fields have target and origin, but we need owner and field index for each target
+        std::vector<NodeData*> class_children;      // some rules can become parent classes for other rules
+        /* rule has fields with (target and origin)
+            - the target is the rule to visit where the field data is built
+            - the origin is the node in the antlr grammar where this field originated from
+            - the fields are only important for rules (nodes) that end up as real classes
+            - a rule (node) carries it's fields but they can originate from another rule/target
+            - the field_names are stored in the carrying rule (node)
+            - the fields are stored in the target rule (node) building the field data
+        */
         antlr4::ParserRuleContext* ctx = nullptr;
         int32_t ref_count = 0;
-        int32_t num_fields = 0;
+        NodeDataType ty;
         bool is_op = false;
         bool is_rule = false;
         bool has_alternative = false;
@@ -195,8 +266,6 @@ class AntlrAstGenerator : public ANTLRv4ParserBaseVisitor
         COLLECT_RULES           = 0,
         COLLECT_TYPES           = 1,
         COUNT_REFS              = 2,
-        CREATE_NODES            = 3,
-        CREATE_SWITCH           = 4
     };
 
     enum class VisitPass : uint32_t
@@ -205,8 +274,6 @@ class AntlrAstGenerator : public ANTLRv4ParserBaseVisitor
         add(COLLECT_RULES),
         add(COLLECT_TYPES),
         add(COUNT_REFS),
-        add(CREATE_NODES),
-        add(CREATE_SWITCH),
 #undef add
         _FORCE_VISIT = 1U << 31
     };
@@ -270,6 +337,8 @@ class AntlrAstGenerator : public ANTLRv4ParserBaseVisitor
             {
                 std::unique_ptr<NodeData> info(new NodeData());
                 info->ctx = ctx;
+                info->id = num_nodes;
+                num_nodes += 1;
                 return node_data[ctx] = std::move(info);
             }
         }
@@ -278,16 +347,21 @@ class AntlrAstGenerator : public ANTLRv4ParserBaseVisitor
         {
             return parent->node;
         }
+
+        static NodeDataMap& getNodes()
+        {
+            return node_data;
+        }
     private:
         NodeData*       node;
         NodeCtx*        parent;
         static NodeCtx* ctx;
         static NodeNameMap nodes;
         static NodeDataMap node_data;
+        static uint32_t    num_nodes;
     };
-
 public:
-    AntlrAstGenerator(ANTLRv4Parser* parser, antlr4::ParserRuleContext* parser_root, antlr4::ParserRuleContext* lexer_root, int32_t numindent = 4);
+    AntlrAstGenerator(ANTLRv4Parser* parser, antlr4::ParserRuleContext* parser_root, antlr4::ParserRuleContext* lexer_root, StateMap *state, int32_t numindent = 4);
     virtual ~AntlrAstGenerator();
 
     virtual std::any visitGrammarSpec(ANTLRv4Parser::GrammarSpecContext *ctx) override;
@@ -401,14 +475,19 @@ private:
     bool hasPass(VisitPass pass) { return passes.hasPass(pass); }
     std::string toString(antlr4::ParserRuleContext *ctx);
     void addRuleNode(std::string& name, NodeDataRef node);
-    void printRuleNode(std::string& name, NodeDataRef node);
+    void printRuleNode(std::string& name, NodeDataRef node, bool root);
+    void printField_Decls(NodeDataRef node);
+    void printField_Stores(NodeDataRef node);
+    void print_PrintFn(NodeDataRef node);
+    void printRuleName(NodeData *node);
     std::any handleNode(std::string &name, antlr4::ParserRuleContext *ctx, int32_t ref = 0);
     void inc_indent() { indent += numindent; }
-    void dev_indent() { indent -= numindent; }
+    void dec_indent() { indent -= numindent; }
     void print_token(antlr4::Token* token);
     void print_text(antlr4::ParserRuleContext* ctx);
+    void fprint(const char* format, ...);
     void print(const char* str);
-    void print(std::string &str);
+    void print(const std::string &str);
     void print(const char* str, int32_t len);
     void print(antlr4::tree::TerminalNode*);
     void newln(bool only_indent = false);
@@ -428,6 +507,7 @@ private:
     FILE*         header;
     ANTLRv4Lexer *lexer;
     ANTLRv4Parser *parser;
+    StateMap* state;
     std::unordered_map<std::string, std::string> map;
 };
 
